@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <threads/synch.h>
+#include "threads/fixed-point.h"
 #include "vm/page.h"
 
 /* States in a thread's life cycle. */
@@ -121,6 +122,12 @@ struct thread
     char name[16];                      /* Name (for debugging purposes). */
     uint8_t *stack;                     /* Saved stack pointer. */
     int priority;                       /* Priority. */
+    int base_priority;                  /* Priority before donation. */
+    struct list locks;                  /* Locks held by this thread. */
+    struct lock *waiting_lock;          /* Lock this thread is waiting for. */
+    int64_t wakeup_tick;                /* Tick when a sleeping thread wakes. */
+    int nice;                           /* Niceness for MLFQS. */
+    fixed_t recent_cpu;                 /* Recent CPU usage for MLFQS. */
     struct list_elem allelem;           /* List element for all threads list. */
 
     /* Shared between thread.c and synch.c. */
@@ -182,6 +189,7 @@ const char *thread_name (void);
 
 void thread_exit (void) NO_RETURN;
 void thread_yield (void);
+void thread_resort_ready_list (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func (struct thread *t, void *aux);
