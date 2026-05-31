@@ -195,25 +195,6 @@ page_fault (struct intr_frame *f)
   
   if (esp != NULL && fault_addr >= esp - 32 && fault_addr < PHYS_BASE) {
     stack_access = true;
-  } else if (fault_addr >= PHYS_BASE - MAX_STACK_SIZE && fault_addr < PHYS_BASE) {
-    /* 檢查是否為 PUSHA 指令 (0x60) 或其他堆疊操作 */
-    uint8_t *eip = (uint8_t *)f->eip;
-    if (user && eip && is_user_vaddr(eip) && pagedir_get_page(thread_current()->pagedir, eip)) {
-      uint8_t opcode = *eip;
-      if (opcode == 0x60 || // pusha
-          opcode == 0x50 || // push eax
-          opcode == 0x51 || // push ecx
-          opcode == 0x52 || // push edx
-          opcode == 0x53 || // push ebx
-          opcode == 0x54 || // push esp
-          opcode == 0x55 || // push ebp
-          opcode == 0x56 || // push esi
-          opcode == 0x57 || // push edi
-          opcode == 0x89 || // mov
-          opcode == 0x8b) { // mov
-        stack_access = true;
-      }
-    }
   }
   
   if (stack_access) {
@@ -242,4 +223,3 @@ page_fault (struct intr_frame *f)
     return;
   }
 }
-

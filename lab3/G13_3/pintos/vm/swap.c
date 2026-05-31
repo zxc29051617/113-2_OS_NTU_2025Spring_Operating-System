@@ -79,7 +79,7 @@ swap_out (struct suppPage *page)
         
     // 先獲取一個 swap slot
     lock_acquire (&swap_lock);
-    size_t slot = bitmap_scan_and_flip (swap_available, 0, 1, false);
+    size_t slot = bitmap_scan_and_flip (swap_available, 0, 1, true);
     lock_release (&swap_lock);
 
     if (slot == BITMAP_ERROR)
@@ -108,7 +108,7 @@ swap_out (struct suppPage *page)
             // 釋放 pin 和swap槽
             vm_frame_unpin(kva);
             lock_acquire (&swap_lock);
-            bitmap_reset (swap_available, slot);
+            bitmap_set (swap_available, slot, true);
             lock_release (&swap_lock);
             return false;
         }
@@ -199,7 +199,7 @@ swap_in (struct suppPage *page, void *kva)
 
     /* 釋放 bitmap */
     lock_acquire (&swap_lock);
-    bitmap_reset (swap_available, slot);
+    bitmap_set (swap_available, slot, true);
     lock_release (&swap_lock);
 
     page->in_swap = false;

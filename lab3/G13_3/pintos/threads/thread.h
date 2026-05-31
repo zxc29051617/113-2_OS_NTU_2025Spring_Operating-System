@@ -3,6 +3,7 @@
 
 #include <debug.h>
 #include <list.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <threads/synch.h>
 #include "vm/page.h"
@@ -88,6 +89,8 @@ typedef int tid_t;
    tid_t tid;
    int st_exit;
    bool succ;
+   bool load_success;
+   struct semaphore sema_load;   /* Semaphore for exec load completion. */
    struct semaphore sema_wait;   /* Semaphore for control waiting. */
    struct list_elem elem;        /* element in `parent->child` */
 };
@@ -98,6 +101,18 @@ struct open_file
    struct file* file;            /* pointor to actual file. */
    struct list_elem elem;        /* Elements for thread's open-file list. */
 };
+
+#ifdef VM
+struct mmap_desc
+{
+   int mapid;
+   struct file *file;
+   void *addr;
+   size_t length;
+   struct list_elem elem;
+};
+#endif
+
 struct thread
   {
     /* Owned by thread.c. */
@@ -131,6 +146,7 @@ struct thread
     /* 虛擬記憶體支援 */
     struct supplemental_page_table *spt;   /* 補充頁表 */
     struct list mmap_list;                 /* struct mmap_desc 的列表 */
+    int next_mapid;
     void *current_esp;                    /* 用戶程序堆棧指pin的當前值，在page錯誤可能在內核中發生時需要 */
 #endif
 

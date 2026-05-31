@@ -89,6 +89,7 @@ struct suppPage {
     off_t  ofs;
     size_t read_bytes;
     size_t zero_bytes;
+    bool mmap;
 
     bool pinned;
 

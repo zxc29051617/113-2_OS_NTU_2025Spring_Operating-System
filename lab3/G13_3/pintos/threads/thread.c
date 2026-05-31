@@ -198,10 +198,12 @@ thread_create (const char *name, int priority,
   // Teresa
   t->child_info = malloc(sizeof(struct child));
   t->child_info->tid = tid;
+  sema_init (&t->child_info->sema_load, 0);
   sema_init (&t->child_info->sema_wait, 0);
   list_push_back (&thread_current()->children, &t->child_info->elem);
   t->child_info->st_exit = UINT32_MAX;
   t->child_info->succ = false;
+  t->child_info->load_success = false;
 #endif
 
   /* Stack frame for kernel_thread(). */
@@ -528,6 +530,7 @@ init_thread (struct thread *t, const char *name, int priority)
   /* 初始化補充頁表為 NULL */
   t->spt = NULL;
   list_init(&t->mmap_list);
+  t->next_mapid = 1;
   t->current_esp = NULL;
 #endif  
 #endif 

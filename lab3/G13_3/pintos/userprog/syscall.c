@@ -22,7 +22,7 @@
 
 /* System call for process. */
 
-void sys_halt(void);
+void sys_halt(struct intr_frame *f);
 void sys_exit(int status);
 void sys_exec(struct intr_frame* f);
 void sys_wait(struct intr_frame* f);
@@ -39,6 +39,10 @@ void sys_tell(struct intr_frame* f);
 void sys_close(struct intr_frame* f);
 
 #ifdef VM
+void sys_mmap(struct intr_frame* f);
+void sys_munmap(struct intr_frame* f);
+static void check_writable_buffer (void *buffer, unsigned size);
+
 /* 預加載並pin住[addr, addr+size)跨越的所有page */
 void
 preload_and_pin_pages(const void *addr, size_t size)
@@ -72,7 +76,6 @@ unpin_preloaded_pages(const void *addr, size_t size)
 
 static void (*syscalls[MAX_SYSCALL])(struct intr_frame *) = {
   [SYS_HALT] = sys_halt,
-  [SYS_EXIT] = (void (*)(struct intr_frame *))sys_exit,
   [SYS_EXEC] = sys_exec,
   [SYS_WAIT] = sys_wait,
   [SYS_CREATE] = sys_create,
@@ -83,7 +86,11 @@ static void (*syscalls[MAX_SYSCALL])(struct intr_frame *) = {
   [SYS_WRITE] = sys_write,
   [SYS_SEEK] = sys_seek,
   [SYS_TELL] = sys_tell,
-  [SYS_CLOSE] = sys_close
+  [SYS_CLOSE] = sys_close,
+#ifdef VM
+  [SYS_MMAP] = sys_mmap,
+  [SYS_MUNMAP] = sys_munmap
+#endif
 };
 
 static void syscall_handler (struct intr_frame *);
@@ -110,10 +117,47 @@ static void *check_ptr(const void *vaddr)
     if (vaddr == NULL || !is_user_vaddr(vaddr))
         invalid_access();
     // 最少要檢查 *vaddr 指向的這一頁已存在
-    if (!pagedir_get_page(thread_current()->pagedir, vaddr))
+    if (!pagedir_get_page(thread_current()->pagedir, vaddr)) {
+#ifdef VM
+        struct thread *t = thread_current();
+        if (t->spt == NULL || !vm_load_page(t->spt, t->pagedir,
+                                            pg_round_down(vaddr)))
+            invalid_access();
+#else
         invalid_access();
+#endif
+    }
     return (void *)vaddr;
 }
+
+#ifdef VM
+static void
+check_writable_buffer (void *buffer, unsigned size)
+{
+  if (size == 0)
+    return;
+
+  uint8_t *start = buffer;
+  uint8_t *end = start + size - 1;
+  if (end < start || !is_user_vaddr (end))
+    invalid_access ();
+
+  check_ptr (start);
+  check_ptr (end);
+
+  for (uint8_t *upage = pg_round_down (start);
+       upage <= (uint8_t *) pg_round_down (end);
+       upage += PGSIZE)
+    {
+      check_ptr (upage);
+      struct suppPage *page = spt_find_page (thread_current ()->spt, upage);
+      if ((page != NULL && !page->writable) ||
+          (page == NULL &&
+           !pagedir_is_writable (thread_current ()->pagedir, upage)))
+        invalid_access ();
+    }
+}
+#endif
 
 static struct open_file *find_file(int fd)
 {
@@ -265,6 +309,7 @@ void sys_read(struct intr_frame *f) {
         check_ptr(buffer + size - 1);
 
 #ifdef VM
+    check_writable_buffer(buffer, size);
     preload_and_pin_pages(buffer, size);
 #endif
 
@@ -337,10 +382,172 @@ void sys_close(struct intr_frame *f) {
     }
 }
 
+#ifdef VM
+static struct mmap_desc *
+find_mmap (int mapid)
+{
+  struct list *maps = &thread_current ()->mmap_list;
+  for (struct list_elem *e = list_begin (maps); e != list_end (maps);
+       e = list_next (e))
+    {
+      struct mmap_desc *m = list_entry (e, struct mmap_desc, elem);
+      if (m->mapid == mapid)
+        return m;
+    }
+  return NULL;
+}
+
+static void
+unmap_mapping (struct mmap_desc *m)
+{
+  struct thread *t = thread_current ();
+  size_t offset;
+
+  for (offset = 0; offset < m->length; offset += PGSIZE)
+    {
+      size_t page_bytes = m->length - offset < PGSIZE
+                            ? m->length - offset
+                            : PGSIZE;
+      vm_supt_mm_unmap (t->spt, t->pagedir, (uint8_t *) m->addr + offset,
+                        m->file, offset, page_bytes);
+    }
+
+  list_remove (&m->elem);
+  acquire_file_lock ();
+  file_close (m->file);
+  release_file_lock ();
+  free (m);
+}
+
+void
+mmap_close_all (void)
+{
+  struct list *maps = &thread_current ()->mmap_list;
+  while (!list_empty (maps))
+    {
+      struct mmap_desc *m = list_entry (list_front (maps),
+                                        struct mmap_desc, elem);
+      unmap_mapping (m);
+    }
+}
+
+void
+sys_mmap (struct intr_frame *f)
+{
+  uint32_t *args = f->esp;
+  check_ptr (args + 1);
+  check_ptr (args + 2);
+
+  int fd = args[1];
+  void *addr = (void *) args[2];
+  struct thread *t = thread_current ();
+
+  if (fd <= 1 || addr == NULL || pg_ofs (addr) != 0 || !is_user_vaddr (addr))
+    {
+      f->eax = -1;
+      return;
+    }
+
+  struct open_file *of = find_file (fd);
+  if (of == NULL)
+    {
+      f->eax = -1;
+      return;
+    }
+
+  acquire_file_lock ();
+  off_t length = file_length (of->file);
+  struct file *map_file = length > 0 ? file_reopen (of->file) : NULL;
+  release_file_lock ();
+
+  if (length <= 0 || map_file == NULL)
+    {
+      f->eax = -1;
+      return;
+    }
+
+  for (off_t offset = 0; offset < length; offset += PGSIZE)
+    {
+      void *upage = (uint8_t *) addr + offset;
+      if (!is_user_vaddr (upage) || spt_find_page (t->spt, upage) != NULL ||
+          pagedir_get_page (t->pagedir, upage) != NULL)
+        {
+          acquire_file_lock ();
+          file_close (map_file);
+          release_file_lock ();
+          f->eax = -1;
+          return;
+        }
+    }
+
+  struct mmap_desc *m = malloc (sizeof *m);
+  if (m == NULL)
+    {
+      acquire_file_lock ();
+      file_close (map_file);
+      release_file_lock ();
+      f->eax = -1;
+      return;
+    }
+
+  size_t installed = 0;
+  for (off_t offset = 0; offset < length; offset += PGSIZE)
+    {
+      void *upage = (uint8_t *) addr + offset;
+      size_t page_read_bytes = length - offset < PGSIZE
+                                 ? length - offset
+                                 : PGSIZE;
+      size_t page_zero_bytes = PGSIZE - page_read_bytes;
+
+      if (!vm_supt_install_filesys (t->spt, upage, map_file, offset,
+                                    page_read_bytes, page_zero_bytes, true))
+        {
+          for (size_t rollback = 0; rollback < installed; rollback += PGSIZE)
+            {
+              size_t bytes = installed - rollback < PGSIZE
+                               ? installed - rollback
+                               : PGSIZE;
+              vm_supt_mm_unmap (t->spt, t->pagedir,
+                                (uint8_t *) addr + rollback,
+                                map_file, rollback, bytes);
+            }
+          acquire_file_lock ();
+          file_close (map_file);
+          release_file_lock ();
+          free (m);
+          f->eax = -1;
+          return;
+        }
+
+      struct suppPage *page = spt_find_page (t->spt, upage);
+      page->mmap = true;
+      installed += page_read_bytes;
+    }
+
+  m->mapid = t->next_mapid++;
+  m->file = map_file;
+  m->addr = addr;
+  m->length = length;
+  list_push_back (&t->mmap_list, &m->elem);
+  f->eax = m->mapid;
+}
+
+void
+sys_munmap (struct intr_frame *f)
+{
+  uint32_t *args = f->esp;
+  check_ptr (args + 1);
+
+  struct mmap_desc *m = find_mmap ((int) args[1]);
+  if (m != NULL)
+    unmap_mapping (m);
+}
+#endif
+
 /* System Call: void halt (void)
     Terminates Pintos by calling shutdown_power_off() (declared in devices/shutdown.h). 
 */
-void sys_halt(void)
+void sys_halt(struct intr_frame *f UNUSED)
 {
   shutdown_power_off();
 }

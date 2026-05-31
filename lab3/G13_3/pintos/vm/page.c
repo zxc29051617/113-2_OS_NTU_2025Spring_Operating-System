@@ -44,7 +44,15 @@ void supplemental_page_table_init(struct supplemental_page_table *spt) {
 static void page_destroy(struct hash_elem *e, void *aux UNUSED) {
     struct suppPage *page = hash_entry(e, struct suppPage, hash_elem);
     if (page->frame) {
-        vm_frame_free(page->frame);
+        if (thread_current()->pagedir != NULL)
+            pagedir_clear_page(thread_current()->pagedir, page->va);
+        vm_frame_free(page->frame->kva);
+    }
+    if (page->in_swap) {
+        vm_swap_free(page->swap_slot);
+    }
+    if (page->aux) {
+        free(page->aux);
     }
     free(page);
 }
@@ -81,6 +89,13 @@ vm_alloc_page(enum vm_type type, void *upage, bool writable) {
     page->pinned = false; // ← 順便初始化
     page->in_swap   = false;          /* 一開始不在 swap */
     page->swap_slot = (size_t) -1;    /* -1 表示「尚未分配 slot」*/
+    page->file = NULL;
+    page->ofs = 0;
+    page->read_bytes = 0;
+    page->zero_bytes = 0;
+    page->mmap = false;
+    page->initializer = NULL;
+    page->aux = NULL;
 
     // 3. 插入
     // 在插入 SPT 之前暫時啟用中斷，因為可能涉及到鎖操作
@@ -194,7 +209,12 @@ vm_do_claim_page (struct suppPage *page)
                 }
                 break;
             case VM_FILE:
-                if (file_read_at(page->file, kva, page->read_bytes, page->ofs) != (int) page->read_bytes) {
+                if (page->in_swap) {
+                    success = swap_in(page, kva);
+                    if (success) {
+                        page->in_swap = false;
+                    }
+                } else if (file_read_at(page->file, kva, page->read_bytes, page->ofs) != (int) page->read_bytes) {
                     success = false;
                 } else {
                     memset(kva + page->read_bytes, 0, page->zero_bytes);
@@ -303,7 +323,6 @@ lazy_load_segment(struct suppPage *page, void *aux)
     void *kva = page->frame->kva;
     // 1. 從 file 讀檔進 frame
     if (file_read_at(fpage->file, kva, read_bytes, offset) != (int)read_bytes) {
-        free(fpage); // <--- 失敗也要 free
         return false;
     }
     // 2. 補 0
@@ -346,6 +365,7 @@ vm_alloc_page_with_initializer(enum vm_type type, void *upage, bool writable,
     page->ofs = 0;
     page->read_bytes = 0;
     page->zero_bytes = 0;
+    page->mmap = false;
 
     if (!spt_insert_page(spt, page)) {
         free(page);
@@ -509,7 +529,18 @@ vm_supt_install_filesys (struct supplemental_page_table *spt, void *upage,
   aux->read_bytes = read_bytes;
   aux->zero_bytes = zero_bytes;
   
-  return vm_alloc_page_with_initializer(VM_FILE, upage, writable, lazy_load_segment, aux);
+  if (!vm_alloc_page_with_initializer(VM_FILE, upage, writable, lazy_load_segment, aux)) {
+    free(aux);
+    return false;
+  }
+
+  struct suppPage *p = spt_find_page(spt, upage);
+  p->file = file;
+  p->ofs = offset;
+  p->read_bytes = read_bytes;
+  p->zero_bytes = zero_bytes;
+  p->mmap = false;
+  return true;
 }
 
 /**
@@ -528,17 +559,22 @@ vm_supt_mm_unmap(
     bool is_dirty = pagedir_is_dirty(pagedir, p->va);
     
     // 如果是檔案映射且為dirty，寫回
-    if (is_dirty && p->type == VM_FILE && f != NULL) {
+    if (is_dirty && p->type == VM_FILE && p->mmap && f != NULL) {
       file_write_at(f, p->frame->kva, bytes, offset);
     }
     
     // 取消page映射
     pagedir_clear_page(pagedir, p->va);
-    vm_frame_free(p->frame);
+    vm_frame_free(p->frame->kva);
   } 
   else if (p->in_swap) {
     // 如果在swap區中，釋放swap槽
     vm_swap_free(p->swap_slot);
+  }
+
+  if (p->aux) {
+    free(p->aux);
+    p->aux = NULL;
   }
   
   // 從 SPT 中移除

@@ -1,4 +1,3 @@
-#include "threads/thread.h"
 #ifndef VM_FRAME_H
 #define VM_FRAME_H
 
@@ -11,6 +10,7 @@
 
 /* Forward declarations ------------- */
 struct suppPage;
+struct thread;
 
 //The frame table entry that contains a user page
 struct frame {
@@ -25,11 +25,11 @@ struct frame {
 void vm_frame_init (void);
 
 /* 主要介面 */
-struct frame *frame_allocate (enum palloc_flags flags);
-void          frame_free     (struct frame *fr);
+struct frame *vm_frame_allocate (enum palloc_flags flags, void *upage);
+void          vm_frame_free     (void *kva);
 
 /* 允許外部快速 pin / unpin （I/O 前後）*/
-void frame_pin   (struct frame *fr);
-void frame_unpin (struct frame *fr);
+void vm_frame_pin   (void *kva);
+void vm_frame_unpin (void *kva);
 
 #endif /* vm/frame.h */

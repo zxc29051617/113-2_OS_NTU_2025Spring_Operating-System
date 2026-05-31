@@ -7,6 +7,7 @@
 #include <string.h>
 #include "userprog/gdt.h"
 #include "userprog/pagedir.h"
+#include "userprog/syscall.h"
 #include "userprog/tss.h"
 #include "filesys/directory.h"
 #include "filesys/file.h"
@@ -22,6 +23,8 @@
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 static void push_argument(void **esp, char *cmdline);
+static void signal_load_status (bool success);
+static struct child *find_child(struct thread *parent, tid_t child_tid);
 
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
@@ -50,6 +53,7 @@ process_execute(const char *file_name)
     }
 
     /* Create a new thread to execute FILE_NAME. */
+    thread_current()->child_loaded = false;
     tid = thread_create(token, PRI_DEFAULT, start_process, fn_copy);
     if (tid == TID_ERROR) {
         free(fn_copy);
@@ -57,9 +61,11 @@ process_execute(const char *file_name)
     }
 
     /* Semaphore: Wait for child process to finish loading. */
-    sema_down(&thread_current()->sema_wait);
-    if (!thread_current()->child_loaded) {
-        free(fn_copy);
+    struct child *child = find_child(thread_current(), tid);
+    if (child == NULL)
+        return TID_ERROR;
+    sema_down(&child->sema_load);
+    if (!child->load_success) {
         return TID_ERROR;
     }
 
@@ -103,6 +109,18 @@ static void push_argument(void **esp, char *cmdline)
     *(void **)(*esp) = NULL;
 }
 
+static void
+signal_load_status (bool success)
+{
+  struct child *child = thread_current ()->child_info;
+
+  if (child != NULL)
+    {
+      child->load_success = success;
+      sema_up (&child->sema_load);
+    }
+}
+
 /* A thread function that loads a user process and starts it
    running. */
 static void
@@ -122,8 +140,8 @@ start_process (void *file_name_)
   /* 創建補充頁表 */
   thread_current()->spt = malloc(sizeof(struct supplemental_page_table));
   if (thread_current()->spt == NULL) {
-    thread_current()->child_loaded = false;
-    sema_up(&thread_current()->parent->sema_wait);
+    free(file_name);
+    signal_load_status (false);
     thread_exit();
   }
   supplemental_page_table_init(thread_current()->spt);
@@ -132,25 +150,24 @@ start_process (void *file_name_)
   /* 分配並激活頁目錄 */
   thread_current()->pagedir = pagedir_create();
   if (thread_current()->pagedir == NULL) {
-    thread_current()->child_loaded = false;
-    sema_up(&thread_current()->parent->sema_wait);
+    free(file_name);
+    signal_load_status (false);
     thread_exit();
   }
   process_activate();
 
   /* 載入可執行文件 */
   success = load (file_name, &if_.eip, &if_.esp);
+  free(file_name);
 
   /* 如果載入失敗，退出 */
   if (!success) {
-    thread_current()->child_loaded = false;
-    sema_up(&thread_current()->parent->sema_wait);
+    signal_load_status (false);
     thread_exit();
   }
 
   /* 通知父線程載入成功 */
-  thread_current()->child_loaded = true;
-  sema_up(&thread_current()->parent->sema_wait);
+  signal_load_status (true);
 
   /* 開始執行用戶程序 */
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
@@ -207,6 +224,8 @@ process_exit (void)
   uint32_t *pd;
 
 #ifdef VM
+  mmap_close_all ();
+
   /* 銷毀補充頁表及其所有page、frame和swap空間 */
   if (cur->spt != NULL) {
     supplemental_page_table_destroy(cur->spt);
@@ -330,6 +349,7 @@ load (const char *file_name, void (**eip) (void), void **esp)
   struct file *file = NULL;
   off_t file_ofs;
   bool success = false;
+  bool locked = false;
   int i;
   
   /* 創建文件名的副本以進行解析 */
@@ -349,18 +369,17 @@ load (const char *file_name, void (**eip) (void), void **esp)
   /* Allocate and activate page directory. */
   t->pagedir = pagedir_create ();
   if (t->pagedir == NULL) {
-    free(fn_copy);
     goto done;
   }
   process_activate ();
 
   /* Open executable file. */
   acquire_file_lock();
+  locked = true;
   file = filesys_open (exec_name);
   if (file == NULL) 
     {
       printf ("load: %s: open failed\n", exec_name);
-      free(fn_copy);
       goto done; 
     }
     /* Deny write for the opened file by calling file deny write */
@@ -377,7 +396,6 @@ load (const char *file_name, void (**eip) (void), void **esp)
       || ehdr.e_phnum > 1024) 
     {
       printf ("load: %s: error loading executable\n", exec_name);
-      free(fn_copy);
       goto done; 
     }
 
@@ -455,7 +473,8 @@ load (const char *file_name, void (**eip) (void), void **esp)
 
  done:
   /* We arrive here whether the load is successful or not. */
-  release_file_lock();
+  if (locked)
+    release_file_lock();
   free(fn_copy);
   return success;
 }

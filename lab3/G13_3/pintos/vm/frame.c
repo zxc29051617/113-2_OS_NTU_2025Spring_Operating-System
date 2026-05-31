@@ -12,6 +12,7 @@
 #include "threads/vaddr.h"
 #include "vm/page.h"
 #include "vm/swap.h"
+#include "filesys/file.h"
 #include <debug.h> 
 
 static struct list frame_table;       /* 雙向循環 list — 保存所有 frame */
@@ -69,6 +70,7 @@ evict_frame (struct frame *victim)
 
     struct suppPage *page = victim->page;
     struct thread   *owner = victim->owner;
+    bool dirty = pagedir_is_dirty (owner->pagedir, page->va);
 
     /* 先在 pagedir 斷開映射，避免 race */
     pagedir_clear_page (owner->pagedir, page->va);
@@ -85,11 +87,22 @@ evict_frame (struct frame *victim)
         break;
 
       case VM_FILE:
-        /* 若是 dirty 且可寫 -> write-back；這裡先偷懶忽略 write-back */
-        if (pagedir_is_dirty (owner->pagedir, page->va) && page->writable)
-            ; /* TODO: file write-back (mmap write) */
-        page->in_swap = false;
-        ok = true;
+        if (page->mmap && dirty && page->file != NULL)
+          {
+            off_t bytes = page->read_bytes;
+            ok = file_write_at (page->file, page->frame->kva, bytes,
+                                page->ofs) == bytes;
+            page->in_swap = false;
+          }
+        else if (!page->mmap && (dirty || page->writable))
+          {
+            ok = swap_out (page);
+          }
+        else
+          {
+            page->in_swap = false;
+            ok = true;
+          }
         break;
 
       default:
