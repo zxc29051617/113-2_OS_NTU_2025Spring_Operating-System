@@ -2,7 +2,7 @@
 
 這個 repository 收錄臺大 113-2 作業系統（王凡老師）課程的 Pintos 實作與期中報告。
 
-Pintos 的 Lab 1 到 Lab 3 是在同一份程式上逐步完成的，三個 lab 的最終程式整合在
+Pintos 的 Lab 1 到 Lab 3 是第 13 組（G13）的分組作業，在同一份程式上逐步完成，三個 lab 的最終程式整合在
 `lab3/G13_3/pintos`。
 
 ## 專案結構
